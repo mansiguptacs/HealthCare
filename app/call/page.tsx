@@ -51,6 +51,12 @@ export default function CallPage() {
   const [liveCaption, setLiveCaption] = useState<string>("");
   const voiceRef = useRef<RealtimeVoiceClient | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // True right after a turn boundary — the next text begins a fresh caption.
+  const newTurnRef = useRef(true);
+  // Latest history, kept in a ref so teardown callbacks never read stale state.
+  const historyRef = useRef<ChatMessage[]>([]);
+  // Guards against finalizing/persisting the call more than once.
+  const endedRef = useRef(false);
 
   const display = history.filter(
     (m) => m.role === "user" || m.role === "assistant",
@@ -65,8 +71,34 @@ export default function CallPage() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [history, voiceStatus]);
 
+  useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+
+  /** Persist the call as ended and flip the UI to the post-call state. Idempotent. */
+  const finalizeCall = useCallback(
+    async (id: string) => {
+      if (endedRef.current) return;
+      endedRef.current = true;
+      setEnded(true);
+      const transcript = historyRef.current
+        .filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => `${m.role}: ${m.content}`)
+        .join("\n");
+      await fetch(`/api/calls/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "ended", transcript }),
+      }).catch(() => {});
+      setTimeout(() => refreshDetails(id), 1200);
+    },
+    [refreshDetails],
+  );
+
   async function beginCall(selectedMode: "text" | "voice") {
     setBusy(true);
+    endedRef.current = false;
+    newTurnRef.current = true;
     const res = await fetch("/api/calls", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -105,13 +137,20 @@ export default function CallPage() {
         setVoiceStatus(`Voice error: ${e}`);
       },
       onUserTranscript: (t) => {
-        if (!t.trim()) return;
-        setHistory((h) => [...h, { role: "user", content: t.trim() }]);
+        const text = t.trim();
+        if (!text) return;
+        setHistory((h) => {
+          // Guard against an identical user line being added twice in a row.
+          const last = h[h.length - 1];
+          if (last?.role === "user" && last.content?.trim() === text) return h;
+          return [...h, { role: "user", content: text }];
+        });
         refreshDetails(id);
       },
       onAgentTranscript: (t) => {
-        // "\n" = turn boundary — keep caption visible, just freeze it
+        // "\n" = turn boundary — freeze the current bubble, mark next as new turn.
         if (t === "\n") {
+          newTurnRef.current = true;
           setHistory((h) => {
             const last = h[h.length - 1];
             if (last?.role === "assistant" && last.content?.trim()) {
@@ -123,36 +162,45 @@ export default function CallPage() {
           return;
         }
 
-        // "__FULL__..." = complete text for this turn (from response.done or
-        // audio_transcript.done). Always replace / set the current bubble.
+        // "__FULL__..." = complete text for this turn (single emit from the client).
         if (t.startsWith("__FULL__")) {
           const text = t.slice(8);
+          newTurnRef.current = false;
           setLiveCaption(text);
           setHistory((h) => {
             const last = h[h.length - 1];
             if (last?.role === "assistant") {
-              // Replace whatever partial text was there (or fill empty bubble)
               return [...h.slice(0, -1), { ...last, content: text }];
             }
-            // No assistant bubble yet — create one
             return [...h, { role: "assistant", content: text }];
           });
           if (callId) refreshDetails(callId);
           return;
         }
 
-        // Streaming delta — update live caption and history simultaneously
-        setLiveCaption((prev) => prev + t);
+        // Streaming delta. If this is the first text of a new turn, start a
+        // fresh caption (don't append to the previous turn's text).
+        const isNewTurn = newTurnRef.current;
+        newTurnRef.current = false;
+        setLiveCaption((prev) => (isNewTurn ? t : prev + t));
         setHistory((h) => {
           const last = h[h.length - 1];
+          // Append to the current (empty or in-progress) assistant bubble.
           if (last?.role === "assistant") {
-            return [...h.slice(0, -1), { ...last, content: (last.content ?? "") + t }];
+            const base = isNewTurn && last.content?.trim() ? "" : (last.content ?? "");
+            return [...h.slice(0, -1), { ...last, content: base + t }];
           }
           return [...h, { role: "assistant", content: t }];
         });
         if (callId) refreshDetails(callId);
       },
       onToolCall: () => refreshDetails(id),
+      onEnd: (reason) => {
+        console.log("[voice] call ended:", reason);
+        setVoiceStatus("Call ended.");
+        setLiveCaption("");
+        void finalizeCall(id);
+      },
     });
     voiceRef.current = client;
     try {
@@ -199,16 +247,7 @@ export default function CallPage() {
   async function endCall() {
     if (!callId) return;
     voiceRef.current?.stop();
-    await fetch(`/api/calls/${callId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        status: "ended",
-        transcript: display.map((m) => `${m.role}: ${m.content}`).join("\n"),
-      }),
-    });
-    setEnded(true);
-    setTimeout(() => refreshDetails(callId), 1500);
+    await finalizeCall(callId);
   }
 
   if (!started) {

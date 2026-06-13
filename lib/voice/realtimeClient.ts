@@ -22,6 +22,8 @@ export type VoiceEvents = {
   onAgentTranscript?: (text: string) => void;
   onToolCall?: (name: string, args: Record<string, unknown>) => void;
   onError?: (message: string) => void;
+  /** Fired when the agent (or server) ends the call so the UI can tear down. */
+  onEnd?: (reason: string) => void;
 };
 
 export class RealtimeVoiceClient {
@@ -39,6 +41,18 @@ export class RealtimeVoiceClient {
   private sessionReadyTimer: ReturnType<typeof setTimeout> | null = null;
   /** Periodic keep-alive so Chrome never auto-suspends the AudioContext. */
   private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+  /** True once any transcript text has been emitted for the current turn. */
+  private turnHadText = false;
+  /** Number of audio delta chunks played in the current turn (for diagnostics). */
+  private turnAudioChunks = 0;
+  /** item_ids whose user transcription we've already surfaced (dedup). */
+  private seenUserItems = new Set<string>();
+  /** Currently-scheduled audio sources, so we can stop them instantly on hangup. */
+  private activeSources = new Set<AudioBufferSourceNode>();
+  /** Set when end_call is invoked; we hang up after the goodbye finishes. */
+  private hangingUp = false;
+  /** call_ids of tool calls already executed, so we never run one twice. */
+  private executedToolCalls = new Set<string>();
 
   constructor(callId: string, events: VoiceEvents) {
     this.callId = callId;
@@ -105,9 +119,15 @@ export class RealtimeVoiceClient {
           voice: "eve",
           turn_detection: {
             type: "server_vad",
-            threshold: 0.4,
-            prefix_padding_ms: 200,
-            silence_duration_ms: 500,
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            // Wait longer before deciding the caller has finished, so a natural
+            // pause mid-sentence doesn't chop her answer into fragments.
+            silence_duration_ms: 1200,
+            // Let the server automatically create Sakhi's response when the
+            // caller stops talking — we no longer force it ourselves (that
+            // caused premature/duplicate replies that fragmented the turn).
+            create_response: true,
           },
           tools: AGENT_TOOLS,
           tool_choice: "auto",
@@ -168,6 +188,29 @@ export class RealtimeVoiceClient {
     this.startMicCapture();
     // Ask Grok to speak first so the patient hears an immediate warm greeting.
     this.send({ type: "response.create" });
+  }
+
+  /**
+   * Disconnect after the goodbye audio has finished playing. We wait for the
+   * scheduled playback head to drain (plus a small tail) so the caller hears
+   * the full closing line before the line goes dead.
+   */
+  private scheduleHangup(reason: string) {
+    // Stop capturing the mic immediately so we don't pick up more speech.
+    this.processor?.disconnect();
+    this.processor = null;
+
+    const ctx = this.audioCtx;
+    const remainingMs = ctx
+      ? Math.max(0, (this.playHead - ctx.currentTime) * 1000)
+      : 0;
+    const delay = Math.min(remainingMs + 800, 15000); // cap so we never hang forever
+
+    this.events.onStatus?.("Wrapping up...");
+    setTimeout(() => {
+      this.events.onEnd?.(reason);
+      this.stop();
+    }, delay);
   }
 
   private startMicCapture() {
@@ -237,60 +280,50 @@ export class RealtimeVoiceClient {
       }
 
       // ── Audio output ────────────────────────────────────────────────────────
-      case "response.audio.delta": {
+      // xAI / OpenAI realtime have used several names for the audio delta event.
+      case "response.audio.delta":
+      case "response.output_audio.delta": {
         if (typeof msg.delta === "string" && msg.delta.length > 0) {
+          this.turnAudioChunks++;
           this.audioChunks++;
-          this.events.onStatus?.(`Speaking… (chunk ${this.audioChunks})`);
+          this.events.onStatus?.("Speaking...");
           await this.playPcm16(base64ToArrayBuffer(msg.delta));
         }
         break;
       }
 
-      // Transcript of the audio the model just spoke (streaming deltas).
-      case "response.audio_transcript.delta": {
-        if (typeof msg.delta === "string" && msg.delta.length > 0) {
-          this.events.onAgentTranscript?.(msg.delta);
-        }
-        break;
-      }
-      case "response.audio_transcript.done": {
-        // Full transcript of one audio turn — use as fallback if deltas didn't fire.
-        if (typeof msg.transcript === "string" && msg.transcript.trim()) {
-          this.events.onAgentTranscript?.("__FULL__" + msg.transcript.trim());
-        }
-        this.events.onAgentTranscript?.("\n");
-        break;
-      }
-
-      // Text-only output delta (fires when modalities includes "text").
+      // ── Live transcript (streaming deltas) ───────────────────────────────────
+      // These are the ONLY places that emit text incrementally during a turn.
+      case "response.audio_transcript.delta":
+      case "response.output_audio_transcript.delta":
       case "response.text.delta": {
         if (typeof msg.delta === "string" && msg.delta.length > 0) {
+          this.turnHadText = true;
           this.events.onAgentTranscript?.(msg.delta);
         }
         break;
       }
-      case "response.text.done": {
-        this.events.onAgentTranscript?.("\n");
-        break;
-      }
 
-      // Full output item completed — reliable fallback to grab the whole text
-      // if delta events were missing or incomplete.
+      // NOTE: response.audio_transcript.done / response.text.done /
+      // response.output_item.done all carry the SAME full text as response.done.
+      // To avoid duplicate bubbles we finalize the turn in exactly ONE place:
+      // the response.done handler below. These events are intentionally ignored.
+      case "response.audio_transcript.done":
+      case "response.output_audio_transcript.done":
+      case "response.text.done":
       case "response.output_item.done": {
-        const item = msg.item as Record<string, unknown> | undefined;
-        if (item?.type === "message") {
-          const content = item.content as Array<Record<string, unknown>> | undefined;
-          const textPart = content?.find((c) => c.type === "text" || c.type === "audio");
-          const text = (textPart?.text ?? textPart?.transcript) as string | undefined;
-          if (text?.trim()) {
-            this.events.onAgentTranscript?.("__FULL__" + text.trim());
-          }
-        }
         break;
       }
 
       // ── User speech ─────────────────────────────────────────────────────────
       case "conversation.item.input_audio_transcription.completed": {
+        // xAI can emit this more than once for the same utterance — dedup by item_id.
+        const itemId = (msg.item_id as string) ?? "";
+        if (itemId && this.seenUserItems.has(itemId)) {
+          console.log("[voice] duplicate user transcription ignored for item", itemId);
+          break;
+        }
+        if (itemId) this.seenUserItems.add(itemId);
         if (typeof msg.transcript === "string" && msg.transcript.trim()) {
           this.events.onUserTranscript?.(msg.transcript.trim());
         }
@@ -305,70 +338,63 @@ export class RealtimeVoiceClient {
 
       case "input_audio_buffer.speech_stopped":
       case "input_audio_buffer.committed": {
-        this.events.onStatus?.("Thinking...");
-        // Explicitly request a response — server_vad should auto-create one,
-        // but being explicit guarantees the model always responds after a pause.
-        this.send({ type: "response.create" });
+        // Do NOT manually create a response here — server_vad (create_response:
+        // true) handles that once, after the caller's full turn. Manually
+        // triggering it caused Sakhi to reply mid-answer and duplicate turns.
+        if (!this.hangingUp) this.events.onStatus?.("Thinking...");
         break;
       }
 
       // ── Response lifecycle ──────────────────────────────────────────────────
-      case "response.created":
+      case "response.created": {
+        // New turn begins — reset per-turn trackers.
+        this.turnHadText = false;
+        this.turnAudioChunks = 0;
+        this.events.onStatus?.("Speaking...");
+        break;
+      }
       case "response.output_item.added": {
         this.events.onStatus?.("Speaking...");
         break;
       }
       case "response.done": {
-        // Extract the full spoken text — fires reliably even when xAI doesn't
-        // send audio_transcript.delta events during streaming.
-        try {
-          const response = msg.response as Record<string, unknown> | undefined;
-          const output = response?.output as Array<Record<string, unknown>> | undefined;
-          if (output?.length) {
-            for (const item of output) {
-              if (item.type === "message") {
-                const content = item.content as Array<Record<string, unknown>> | undefined;
-                if (content?.length) {
-                  for (const part of content) {
-                    // audio parts have a "transcript" field; text parts have "text"
-                    const text = (part.transcript ?? part.text) as string | undefined;
-                    if (text?.trim()) {
-                      console.log("[voice] response.done transcript:", text.slice(0, 120));
-                      this.events.onAgentTranscript?.("__FULL__" + text.trim());
-                      this.events.onAgentTranscript?.("\n");
-                    }
-                  }
-                }
-              }
-            }
-          }
-        } catch (e) {
-          console.warn("[voice] could not extract transcript from response.done", e);
+        // Delivery path B: some servers put function calls in the response
+        // output instead of emitting response.function_call_arguments.done.
+        // Execute any we haven't already handled (dedup by call_id).
+        const toolCalls = extractToolCalls(msg);
+        for (const tc of toolCalls) {
+          await this.handleToolCall(tc.name, tc.callId, tc.args, false);
         }
-        this.events.onStatus?.("Listening...");
+
+        // SINGLE finalization point for the turn's TEXT.
+        if (!this.turnHadText) {
+          const fullText = extractResponseText(msg);
+          if (fullText) {
+            console.log("[voice] response.done full text:", fullText.slice(0, 120));
+            this.events.onAgentTranscript?.("__FULL__" + fullText);
+          }
+        }
+        // End the turn (freezes the current bubble).
+        this.events.onAgentTranscript?.("\n");
+
+        if (this.turnAudioChunks === 0) {
+          console.warn("[voice] ⚠ turn finished with 0 audio chunks — no audio was received from the server for this response.");
+        } else {
+          console.log(`[voice] turn played ${this.turnAudioChunks} audio chunks`);
+        }
+
+        this.turnHadText = false;
+        if (!this.hangingUp) this.events.onStatus?.("Listening...");
         break;
       }
 
-      // ── Tool calls ──────────────────────────────────────────────────────────
+      // ── Tool calls (delivery path A: dedicated event) ────────────────────────
       case "response.function_call_arguments.done": {
         const name = msg.name as string;
-        const toolCallId = msg.call_id as string;
+        const toolCallId = (msg.call_id as string) ?? (msg.item_id as string) ?? "";
         let args: Record<string, unknown> = {};
         try { args = JSON.parse((msg.arguments as string) || "{}"); } catch { /**/ }
-
-        this.events.onToolCall?.(name, args);
-        this.events.onStatus?.(`Running ${name}...`);
-
-        const result = await this.runTool(name, args);
-        this.send({
-          type: "conversation.item.create",
-          item: {
-            type: "function_call_output",
-            call_id: toolCallId,
-            output: JSON.stringify(result),
-          },
-        });
-        this.send({ type: "response.create" });
+        await this.handleToolCall(name, toolCallId, args, true);
         break;
       }
 
@@ -380,9 +406,71 @@ export class RealtimeVoiceClient {
         break;
       }
 
-      default:
-        // Log anything we don't handle so we can see every event xAI sends
+      default: {
+        // Catch-all: if an unhandled event carries a base64 audio delta under
+        // any "audio" event name we didn't anticipate, play it anyway so audio
+        // is never silently dropped.
+        if (
+          type.includes("audio") &&
+          type.includes("delta") &&
+          typeof msg.delta === "string" &&
+          msg.delta.length > 0
+        ) {
+          console.log("[voice] playing audio from unhandled event:", type);
+          this.turnAudioChunks++;
+          this.audioChunks++;
+          this.events.onStatus?.("Speaking...");
+          await this.playPcm16(base64ToArrayBuffer(msg.delta));
+          break;
+        }
         console.log("[voice] unhandled event:", type, JSON.stringify(msg).slice(0, 200));
+      }
+    }
+  }
+
+  /**
+   * Execute one tool call, send the result back to the model, and handle the
+   * special `end_call` tool. Deduplicated by call_id so the two delivery paths
+   * (dedicated event vs. response.done output) never double-run a tool.
+   *
+   * @param sendResult whether to send a function_call_output + response.create.
+   *   True for the live event path; false for the response.done path (the turn
+   *   is already finished there, so we just act on end_call locally).
+   */
+  private async handleToolCall(
+    name: string,
+    callId: string,
+    args: Record<string, unknown>,
+    sendResult: boolean,
+  ) {
+    const dedupKey = callId || `${name}:${JSON.stringify(args)}`;
+    if (this.executedToolCalls.has(dedupKey)) return;
+    this.executedToolCalls.add(dedupKey);
+
+    console.log("[voice] tool call:", name, args);
+    this.events.onToolCall?.(name, args);
+
+    if (name === "end_call") {
+      console.log("[voice] end_call requested — will hang up after goodbye");
+      // Record it for traceability (no DB side-effect).
+      void this.runTool(name, args);
+      this.hangingUp = true;
+      this.scheduleHangup(String(args.reason ?? "help_complete"));
+      return;
+    }
+
+    const result = await this.runTool(name, args);
+    if (sendResult && callId) {
+      this.send({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: callId,
+          output: JSON.stringify(result),
+        },
+      });
+      this.events.onStatus?.(`Running ${name}...`);
+      this.send({ type: "response.create" });
     }
   }
 
@@ -430,6 +518,10 @@ export class RealtimeVoiceClient {
     src.buffer = audioBuffer;
     src.connect(this.audioCtx.destination);
 
+    // Track the source so stop() can halt playback instantly.
+    this.activeSources.add(src);
+    src.onended = () => this.activeSources.delete(src);
+
     const now = this.audioCtx.currentTime;
 
     // If the playhead has fallen behind currentTime (first chunk, or a long
@@ -452,12 +544,78 @@ export class RealtimeVoiceClient {
   stop() {
     if (this.sessionReadyTimer) { clearTimeout(this.sessionReadyTimer); this.sessionReadyTimer = null; }
     if (this.keepAliveTimer) { clearInterval(this.keepAliveTimer); this.keepAliveTimer = null; }
+
+    // Halt any scheduled audio immediately so playback can't linger after hangup.
+    for (const src of this.activeSources) {
+      try { src.stop(); } catch { /* already stopped */ }
+    }
+    this.activeSources.clear();
+
     this.processor?.disconnect();
+    this.processor = null;
     this.micStream?.getTracks().forEach((t) => t.stop());
+    this.micStream = null;
     this.ws?.close();
     this.ws = null;
-    setTimeout(() => this.audioCtx?.close(), 1500);
+    void this.audioCtx?.close().catch(() => {});
+    this.audioCtx = null;
   }
+}
+
+/**
+ * Pull the full spoken/written text out of a `response.done` payload.
+ * Handles both audio parts (which carry a `transcript`) and text parts
+ * (which carry `text`). Returns a trimmed string, or "" if none found.
+ */
+function extractResponseText(msg: Record<string, unknown>): string {
+  try {
+    const response = msg.response as Record<string, unknown> | undefined;
+    const output = response?.output as Array<Record<string, unknown>> | undefined;
+    if (!output?.length) return "";
+    const parts: string[] = [];
+    for (const item of output) {
+      if (item.type !== "message") continue;
+      const content = item.content as Array<Record<string, unknown>> | undefined;
+      if (!content?.length) continue;
+      for (const part of content) {
+        const text = (part.transcript ?? part.text) as string | undefined;
+        if (text?.trim()) parts.push(text.trim());
+      }
+    }
+    return parts.join(" ").trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Pull any function calls out of a `response.done` payload. Some realtime
+ * servers deliver tool calls as output items here instead of via the dedicated
+ * response.function_call_arguments.done event.
+ */
+function extractToolCalls(
+  msg: Record<string, unknown>,
+): Array<{ name: string; callId: string; args: Record<string, unknown> }> {
+  const out: Array<{ name: string; callId: string; args: Record<string, unknown> }> = [];
+  try {
+    const response = msg.response as Record<string, unknown> | undefined;
+    const output = response?.output as Array<Record<string, unknown>> | undefined;
+    if (!output?.length) return out;
+    for (const item of output) {
+      if (item.type !== "function_call") continue;
+      const name = item.name as string | undefined;
+      if (!name) continue;
+      const callId = (item.call_id as string) ?? (item.id as string) ?? "";
+      let args: Record<string, unknown> = {};
+      try {
+        args = typeof item.arguments === "string"
+          ? JSON.parse(item.arguments || "{}")
+          : ((item.arguments as Record<string, unknown>) ?? {});
+      } catch { /* keep empty */ }
+      out.push({ name, callId, args });
+    }
+  } catch { /* ignore */ }
+  return out;
 }
 
 // ─── Audio math helpers ───────────────────────────────────────────────────────

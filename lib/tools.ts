@@ -252,6 +252,13 @@ export async function executeTool(
         break;
       }
 
+      case "end_call": {
+        // No DB side-effect — the actual disconnect happens client-side. We log
+        // it (below) so the call's traceability records why/when it ended.
+        result = { ok: true, ended: true, reason: rawArgs.reason ?? "help_complete" };
+        break;
+      }
+
       default:
         result = { ok: false, error: `unknown_tool:${name}` };
     }
