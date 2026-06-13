@@ -1,52 +1,67 @@
-import { PGlite } from "@electric-sql/pglite";
-import { drizzle } from "drizzle-orm/pglite";
-import * as schema from "./schema";
-
 /**
- * Local-first database using PGlite (embedded Postgres, WASM). This gives us a
- * real Postgres dialect with zero external setup so the project is testable
- * immediately. For production on Vercel, swap this file for a Neon/Vercel
- * Postgres client (drizzle-orm/neon-http) pointed at process.env.DATABASE_URL.
+ * Dual-mode database client.
  *
- * The drizzle instance is created lazily on first use so that build-time /
- * static-generation workers never open the single-process PGlite store (which
- * would risk corrupting the local file database).
+ * Production (DATABASE_URL set):  Neon serverless HTTP — real Postgres,
+ *   persistent across requests, works in Vercel serverless functions.
+ *
+ * Local dev (no DATABASE_URL):  PGlite — embedded Postgres WASM, zero setup,
+ *   data stored in .pgdata directory.
  */
 
-type DrizzleDb = ReturnType<typeof drizzle<typeof schema>>;
+import * as schema from "./schema";
 
-const DATA_DIR = process.env.PGLITE_DATA_DIR ?? "./.pgdata";
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyDb = any;
 
 const globalForDb = globalThis as unknown as {
-  __pglite?: PGlite;
-  __db?: DrizzleDb;
+  __db?: AnyDb;
+  __pglite?: import("@electric-sql/pglite").PGlite;
   __pgliteHooked?: boolean;
 };
 
-function init(): DrizzleDb {
+function init(): AnyDb {
   if (globalForDb.__db) return globalForDb.__db;
 
-  const client = globalForDb.__pglite ?? new PGlite(DATA_DIR);
-  if (process.env.NODE_ENV !== "production") globalForDb.__pglite = client;
+  if (process.env.DATABASE_URL) {
+    // ── Neon serverless (production) ────────────────────────────────────────
+    // Both neon() and drizzle() are synchronous — only query execution is async.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { neon } = require("@neondatabase/serverless") as typeof import("@neondatabase/serverless");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { drizzle } = require("drizzle-orm/neon-http") as typeof import("drizzle-orm/neon-http");
+    const sql = neon(process.env.DATABASE_URL);
+    const db = drizzle(sql, { schema, casing: "snake_case" });
+    globalForDb.__db = db;
+    return db;
+  }
 
-  // Flush PGlite to disk on clean shutdown so a Ctrl+C doesn't corrupt the file
-  // store. (A hard kill -9 can still corrupt it; recover with `npm run db:reset`.)
-  if (typeof process !== "undefined" && !globalForDb.__pgliteHooked) {
+  // ── PGlite (local dev) ────────────────────────────────────────────────────
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { PGlite } = require("@electric-sql/pglite") as typeof import("@electric-sql/pglite");
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { drizzle } = require("drizzle-orm/pglite") as typeof import("drizzle-orm/pglite");
+
+  const dataDir = process.env.PGLITE_DATA_DIR ?? "./.pgdata";
+  const client = globalForDb.__pglite ?? new PGlite(dataDir);
+  globalForDb.__pglite = client;
+
+  if (!globalForDb.__pgliteHooked) {
     globalForDb.__pgliteHooked = true;
-    const close = () => {
-      void client.close().finally(() => process.exit(0));
-    };
+    const close = () => void client.close().finally(() => process.exit(0));
     process.once("SIGINT", close);
     process.once("SIGTERM", close);
   }
 
-  const instance = drizzle(client, { schema, casing: "snake_case" });
-  if (process.env.NODE_ENV !== "production") globalForDb.__db = instance;
-  return instance;
+  const db = drizzle(client, { schema, casing: "snake_case" });
+  globalForDb.__db = db;
+  return db;
 }
 
-export const db = new Proxy({} as DrizzleDb, {
+// Proxy defers init until first use so build-time static-generation workers
+// never open PGlite (which would corrupt the local file store).
+export const db: AnyDb = new Proxy({} as AnyDb, {
   get(_target, prop, receiver) {
+    if (prop === "then") return undefined; // not a Promise itself
     const real = init();
     const value = Reflect.get(real as object, prop, receiver);
     return typeof value === "function" ? value.bind(real) : value;

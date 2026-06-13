@@ -8,13 +8,17 @@
     "start": "next start",
     "lint": "eslint",
     "db:push": "drizzle-kit push",
+    "db:migrate": "drizzle-kit migrate",
     "db:seed": "tsx db/seed.ts",
     "db:reset": "rm -rf .pgdata && drizzle-kit push --force && tsx db/seed.ts",
     "db:studio": "drizzle-kit studio",
-    "inngest": "inngest-cli dev -u http://localhost:3000/api/inngest"
+    "inngest": "inngest-cli dev -u http://localhost:3000/api/inngest",
+    "build": "next build",
+    "vercel-build": "[ -n \"$DATABASE_URL\" ] && drizzle-kit migrate; next build"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.2",
+    "@neondatabase/serverless": "^1.1.0",
     "drizzle-orm": "^0.45.2",
     "inngest": "^4.5.1",
     "leaflet": "^1.9.4",

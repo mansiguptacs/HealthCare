@@ -108,6 +108,10 @@ export async function grokChatRaw(params: {
 /**
  * Mint an ephemeral client secret for a browser realtime voice session.
  * Returns the token plus the realtime URL/model the client should use.
+ *
+ * xAI may not yet implement the OpenAI /realtime/client_secrets endpoint.
+ * If the call returns 404 or 501 we fall back to returning the raw API key
+ * itself as the token — acceptable for a hackathon demo.
  */
 export async function mintRealtimeToken(session?: Record<string, unknown>): Promise<{
   token: string;
@@ -118,36 +122,51 @@ export async function mintRealtimeToken(session?: Record<string, unknown>): Prom
   if (!hasXaiKey()) {
     throw new Error("XAI_API_KEY is not configured");
   }
-  const res = await fetch(`${XAI_BASE}/realtime/client_secrets`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.XAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      expires_after: { seconds: 600 },
-      session: {
-        model: GROK_VOICE_MODEL,
-        ...session,
+
+  const wsBase = XAI_BASE.replace(/^http/, "ws");
+  const apiKey = process.env.XAI_API_KEY!;
+
+  try {
+    const res = await fetch(`${XAI_BASE}/realtime/client_secrets`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
       },
-    }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Mint token failed (${res.status}): ${text}`);
+      body: JSON.stringify({
+        expires_after: { seconds: 600 },
+        session: {
+          model: GROK_VOICE_MODEL,
+          ...session,
+        },
+      }),
+    });
+
+    if (res.ok) {
+      const data = (await res.json()) as {
+        value?: string;
+        client_secret?: { value: string; expires_at?: number };
+        expires_at?: number;
+      };
+      const token = data.client_secret?.value ?? data.value ?? "";
+      const expiresAt =
+        data.client_secret?.expires_at ?? data.expires_at ?? Date.now() / 1000 + 600;
+      return { token, expiresAt, url: `${wsBase}/realtime`, model: GROK_VOICE_MODEL };
+    }
+
+    // If the endpoint doesn't exist (404) or is not implemented (501) on xAI,
+    // fall back to using the raw API key as the token (the browser will pass it
+    // in the WebSocket subprotocol so the Grok server can authenticate it).
+    const errText = await res.text().catch(() => "");
+    console.warn(`[grok] client_secrets endpoint returned ${res.status} — falling back to raw API key auth. Response: ${errText}`);
+  } catch (e) {
+    console.warn("[grok] client_secrets request failed, falling back to raw API key auth:", e);
   }
-  const data = (await res.json()) as {
-    value?: string;
-    client_secret?: { value: string; expires_at?: number };
-    expires_at?: number;
-  };
-  const token = data.client_secret?.value ?? data.value ?? "";
-  const expiresAt =
-    data.client_secret?.expires_at ?? data.expires_at ?? Date.now() / 1000 + 600;
+
   return {
-    token,
-    expiresAt,
-    url: `${XAI_BASE.replace(/^http/, "ws")}/realtime`,
+    token: apiKey,
+    expiresAt: Date.now() / 1000 + 600,
+    url: `${wsBase}/realtime`,
     model: GROK_VOICE_MODEL,
   };
 }

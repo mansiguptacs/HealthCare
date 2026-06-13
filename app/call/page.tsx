@@ -47,11 +47,13 @@ export default function CallPage() {
   const [details, setDetails] = useState<CallDetails | null>(null);
   const [voiceStatus, setVoiceStatus] = useState<string>("");
   const [ended, setEnded] = useState(false);
+  // Tracks the sentence Sakhi is currently speaking (cleared on turn boundary)
+  const [liveCaption, setLiveCaption] = useState<string>("");
   const voiceRef = useRef<RealtimeVoiceClient | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const display = history.filter(
-    (m) => (m.role === "user" || m.role === "assistant") && m.content,
+    (m) => m.role === "user" || m.role === "assistant",
   );
 
   const refreshDetails = useCallback(async (id: string) => {
@@ -88,18 +90,68 @@ export default function CallPage() {
 
   async function startVoice(id: string) {
     const client = new RealtimeVoiceClient(id, {
-      onStatus: (s) => setVoiceStatus(s),
-      onError: (e) => setVoiceStatus(`Voice unavailable: ${e}. Switch to text mode below.`),
-      onUserTranscript: (t) =>
-        setHistory((h) => [...h, { role: "user", content: t }]),
-      onAgentTranscript: (t) =>
+      onStatus: (s) => {
+        setVoiceStatus(s);
+        if (s.startsWith("Speaking") || s.startsWith("Connected")) {
+          ensureAssistantBubble();
+        }
+        // When user starts speaking (Thinking = speech detected), clear the
+        // previous caption so the card is ready for the next Sakhi turn.
+        if (s.toLowerCase().includes("thinking")) {
+          setLiveCaption("");
+        }
+      },
+      onError: (e) => {
+        setVoiceStatus(`Voice error: ${e}`);
+      },
+      onUserTranscript: (t) => {
+        if (!t.trim()) return;
+        setHistory((h) => [...h, { role: "user", content: t.trim() }]);
+        refreshDetails(id);
+      },
+      onAgentTranscript: (t) => {
+        // "\n" = turn boundary — keep caption visible, just freeze it
+        if (t === "\n") {
+          setHistory((h) => {
+            const last = h[h.length - 1];
+            if (last?.role === "assistant" && last.content?.trim()) {
+              return [...h, { role: "assistant", content: "" }];
+            }
+            return h;
+          });
+          if (callId) refreshDetails(callId);
+          return;
+        }
+
+        // "__FULL__..." = complete text for this turn (from response.done or
+        // audio_transcript.done). Always replace / set the current bubble.
+        if (t.startsWith("__FULL__")) {
+          const text = t.slice(8);
+          setLiveCaption(text);
+          setHistory((h) => {
+            const last = h[h.length - 1];
+            if (last?.role === "assistant") {
+              // Replace whatever partial text was there (or fill empty bubble)
+              return [...h.slice(0, -1), { ...last, content: text }];
+            }
+            // No assistant bubble yet — create one
+            return [...h, { role: "assistant", content: text }];
+          });
+          if (callId) refreshDetails(callId);
+          return;
+        }
+
+        // Streaming delta — update live caption and history simultaneously
+        setLiveCaption((prev) => prev + t);
         setHistory((h) => {
           const last = h[h.length - 1];
           if (last?.role === "assistant") {
             return [...h.slice(0, -1), { ...last, content: (last.content ?? "") + t }];
           }
           return [...h, { role: "assistant", content: t }];
-        }),
+        });
+        if (callId) refreshDetails(callId);
+      },
       onToolCall: () => refreshDetails(id),
     });
     voiceRef.current = client;
@@ -107,9 +159,18 @@ export default function CallPage() {
       await client.start();
     } catch (e) {
       setVoiceStatus(
-        `${(e as Error).message} Use text mode below to test the full flow.`,
+        `Could not start voice: ${(e as Error).message}. Use text intake below.`,
       );
     }
+  }
+
+  /** Pre-seed an empty assistant bubble so text streams in visibly from the start. */
+  function ensureAssistantBubble() {
+    setHistory((h) => {
+      const last = h[h.length - 1];
+      if (last?.role === "assistant") return h;
+      return [...h, { role: "assistant", content: "" }];
+    });
   }
 
   async function sendTurn(id: string, newHistory: ChatMessage[]) {
@@ -189,10 +250,16 @@ export default function CallPage() {
     );
   }
 
+  const isSpeaking =
+    voiceStatus.toLowerCase().includes("speak") ||
+    voiceStatus.toLowerCase().includes("greeting") ||
+    voiceStatus.toLowerCase().includes("chunk");
+
   return (
     <div className="mx-auto max-w-6xl px-5 py-8 grid lg:grid-cols-[1.4fr_1fr] gap-6">
-      <div className="card flex flex-col h-[70vh]">
-        <div className="px-5 py-3 border-b border-[var(--border)] flex items-center justify-between">
+      <div className="card flex flex-col h-[85vh]">
+        {/* Header */}
+        <div className="px-5 py-3 border-b border-[var(--border)] flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
             <span className="relative flex h-2.5 w-2.5">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--primary)] opacity-60" />
@@ -219,58 +286,104 @@ export default function CallPage() {
           )}
         </div>
 
-        <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
-          {mode === "voice" && (
-            <div className="text-center text-xs text-[var(--muted)] py-2">
-              {voiceStatus || "Connecting..."}
+        {/* ── Live caption card (voice mode) ─────────────────────────────── */}
+        {mode === "voice" && (
+          <div className={`shrink-0 mx-4 mt-4 rounded-2xl px-5 py-4 border transition-all duration-300 ${
+            isSpeaking
+              ? "bg-[var(--primary-soft)] border-[var(--primary)]/30 shadow-sm"
+              : liveCaption
+              ? "bg-[var(--surface)] border-[var(--border)]"
+              : "bg-[var(--surface)] border-[var(--border)]"
+          }`}>
+            <div className="flex items-center gap-2 mb-2">
+              {isSpeaking ? (
+                <span className="flex gap-[3px] items-end h-4">
+                  {[0, 80, 160, 80, 0].map((delay, i) => (
+                    <span
+                      key={i}
+                      className="w-[3px] rounded-full bg-[var(--primary)] animate-bounce"
+                      style={{ animationDelay: `${delay}ms`, height: i % 2 === 0 ? "8px" : "14px" }}
+                    />
+                  ))}
+                </span>
+              ) : (
+                <span className={`w-2 h-2 rounded-full ${liveCaption ? "bg-[var(--primary)]" : "bg-[var(--muted)]"}`} />
+              )}
+              <span className={`text-[11px] font-bold uppercase tracking-widest ${
+                isSpeaking || liveCaption ? "text-[var(--primary)]" : "text-[var(--muted)]"
+              }`}>
+                {isSpeaking ? "Sakhi is speaking" : liveCaption ? "Sakhi said" : voiceStatus || "Connecting…"}
+              </span>
             </div>
-          )}
-          {display.map((m, i) => (
-            <div
-              key={i}
-              className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <div
-                className={`max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                  m.role === "user"
-                    ? "bg-[var(--primary)] text-white rounded-br-sm"
-                    : "bg-[var(--background)] border border-[var(--border)] rounded-bl-sm"
-                }`}
-              >
-                {m.content}
+
+            {/* Text content: show liveCaption if available, else show animated
+                dots while audio plays (transcript arrives after audio on xAI) */}
+            {liveCaption ? (
+              <p className="text-base leading-relaxed font-medium text-[var(--foreground)]">
+                {liveCaption}
+              </p>
+            ) : isSpeaking ? (
+              <span className="flex gap-1.5 items-center mt-1">
+                <span className="w-2 h-2 rounded-full bg-[var(--primary)] animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="w-2 h-2 rounded-full bg-[var(--primary)] animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="w-2 h-2 rounded-full bg-[var(--primary)] animate-bounce" style={{ animationDelay: "300ms" }} />
+              </span>
+            ) : (
+              <p className="text-sm text-[var(--muted)] italic min-h-[1.5rem]">
+                {voiceStatus || "Waiting for Sakhi…"}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* ── Scrolling transcript ────────────────────────────────────────── */}
+        <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {mode === "voice" && <VoiceStatusBar status={voiceStatus} />}
+
+          {display.map((m, i) => {
+            const isSakhi = m.role === "assistant";
+            return (
+              <div key={i} className="space-y-0.5">
+                <div className={`text-[10px] font-bold uppercase tracking-widest ${
+                  isSakhi ? "text-[var(--primary)]" : "text-[var(--accent)]"
+                }`}>
+                  {isSakhi ? "Sakhi" : "You"}
+                </div>
+                <div className={`text-sm leading-relaxed ${
+                  isSakhi ? "text-[var(--foreground)]" : "text-[var(--muted)]"
+                }`}>
+                  {m.content ? m.content : (
+                    <span className="flex gap-1 items-center text-[var(--muted)]">
+                      <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce" style={{ animationDelay: "0ms" }} />
+                      <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce" style={{ animationDelay: "150ms" }} />
+                      <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce" style={{ animationDelay: "300ms" }} />
+                    </span>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
+
           {busy && (
-            <div className="text-xs text-[var(--muted)]">Sakhi is thinking...</div>
+            <div className="space-y-0.5">
+              <div className="text-[10px] font-bold uppercase tracking-widest text-[var(--primary)]">Sakhi</div>
+              <span className="flex gap-1 items-center text-[var(--muted)]">
+                <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-current animate-bounce" style={{ animationDelay: "300ms" }} />
+              </span>
+            </div>
           )}
         </div>
 
-        {mode === "text" && !ended && (
-          <div className="border-t border-[var(--border)] p-3 flex gap-2">
+        {/* Text input (text mode, or voice fallback on error) */}
+        {(mode === "text" || (mode === "voice" && voiceStatus.toLowerCase().includes("error"))) && !ended && (
+          <div className="border-t border-[var(--border)] p-3 flex gap-2 shrink-0">
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && onSend()}
-              placeholder="Type what you'd tell the helpline..."
-              className="flex-1 rounded-xl border border-[var(--border)] px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/30"
-            />
-            <button
-              onClick={onSend}
-              disabled={busy}
-              className="px-5 py-2.5 rounded-xl bg-[var(--primary)] text-white font-semibold text-sm disabled:opacity-50"
-            >
-              Send
-            </button>
-          </div>
-        )}
-        {mode === "voice" && voiceStatus.includes("text mode") && !ended && (
-          <div className="border-t border-[var(--border)] p-3 flex gap-2">
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && onSend()}
-              placeholder="Type instead..."
+              placeholder={mode === "text" ? "Type what you'd tell the helpline…" : "Type instead…"}
               className="flex-1 rounded-xl border border-[var(--border)] px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/30"
             />
             <button
@@ -285,6 +398,35 @@ export default function CallPage() {
       </div>
 
       <LivePanel details={details} />
+    </div>
+  );
+}
+
+function VoiceStatusBar({ status }: { status: string }) {
+  const isListening = status.toLowerCase().includes("listening");
+  const isSpeaking = status.toLowerCase().includes("speak") || status.toLowerCase().includes("greeting") || status.toLowerCase().includes("chunk");
+  const isThinking = status.toLowerCase().includes("think") || status.toLowerCase().includes("running") || status.toLowerCase().includes("config");
+  const isError = status.toLowerCase().includes("error") || status.toLowerCase().includes("disconnected");
+
+  const dot = isListening
+    ? "bg-[var(--primary)]"
+    : isSpeaking
+    ? "bg-[var(--accent)]"
+    : isThinking
+    ? "bg-amber-500"
+    : isError
+    ? "bg-[var(--danger)]"
+    : "bg-[var(--muted)]";
+
+  return (
+    <div className="flex items-center gap-2 text-xs text-[var(--muted)] pb-2 border-b border-[var(--border)] mb-1">
+      <span className={`relative flex h-2 w-2 shrink-0`}>
+        {(isListening || isSpeaking) && (
+          <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${dot} opacity-60`} />
+        )}
+        <span className={`relative inline-flex rounded-full h-2 w-2 ${dot}`} />
+      </span>
+      <span>{status || "Connecting..."}</span>
     </div>
   );
 }
