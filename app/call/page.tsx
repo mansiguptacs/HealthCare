@@ -140,9 +140,19 @@ export default function CallPage() {
         const text = t.trim();
         if (!text) return;
         setHistory((h) => {
-          // Guard against an identical user line being added twice in a row.
           const last = h[h.length - 1];
-          if (last?.role === "user" && last.content?.trim() === text) return h;
+          // xAI can emit several transcription.completed events for one utterance,
+          // each with growing cumulative text and a fresh item_id. Rather than
+          // appending each chunk as a new line, update the current user bubble
+          // in place whenever the new text continues (or duplicates) it.
+          if (last?.role === "user" && last.content) {
+            const prev = last.content.trim();
+            if (text === prev || text.startsWith(prev) || prev.startsWith(text)) {
+              const merged = text.length >= prev.length ? text : prev;
+              if (merged === prev) return h;
+              return [...h.slice(0, -1), { ...last, content: merged }];
+            }
+          }
           return [...h, { role: "user", content: text }];
         });
         refreshDetails(id);
