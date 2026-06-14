@@ -5,6 +5,7 @@ import {
   calls,
   campRequests,
   clinics,
+  patientNotes,
   waitlistEntries,
 } from "@/db/schema";
 import { coarseCell, haversineKm } from "@/lib/geo";
@@ -128,6 +129,71 @@ export async function GET() {
     .filter((c) => !c.covered && c.demandWeight > 0)
     .slice(0, 5);
 
+  // ── Breakdowns for charts ──────────────────────────────────────────────────
+  const allNotes = await db.select().from(patientNotes);
+
+  const catCounts = new Map<string, number>();
+  const sevCounts = new Map<string, number>();
+  const tally = (
+    map: Map<string, number>,
+    key: string | null | undefined,
+  ) => {
+    if (!key) return;
+    map.set(key, (map.get(key) ?? 0) + 1);
+  };
+  for (const w of waiting) {
+    tally(catCounts, w.problemCategory);
+    tally(sevCounts, w.severity);
+  }
+  for (const n of allNotes) {
+    tally(catCounts, n.problemCategory);
+    tally(sevCounts, n.severity);
+  }
+  const categories = [...catCounts.entries()]
+    .map(([category, count]) => ({ category, count }))
+    .sort((a, b) => b.count - a.count);
+  const severities = [...sevCounts.entries()]
+    .map(([severity, count]) => ({ severity, count }))
+    .sort((a, b) => b.count - a.count);
+
+  // ── Call volume timeline (last 14 days) ────────────────────────────────────
+  const DAY = 24 * 60 * 60 * 1000;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const timeline: { date: string; label: string; count: number }[] = [];
+  for (let i = 13; i >= 0; i--) {
+    const day = new Date(today.getTime() - i * DAY);
+    const next = new Date(day.getTime() + DAY);
+    const count = allCalls.filter((c) => {
+      const t = c.startedAt ? new Date(c.startedAt).getTime() : 0;
+      return t >= day.getTime() && t < next.getTime();
+    }).length;
+    timeline.push({
+      date: day.toISOString().slice(0, 10),
+      label: `${day.getMonth() + 1}/${day.getDate()}`,
+      count,
+    });
+  }
+
+  // ── Period-over-period trend (last 7 days vs previous 7) ────────────────────
+  const now = Date.now();
+  const inWindow = (t: number, startDaysAgo: number, endDaysAgo: number) =>
+    t >= now - startDaysAgo * DAY && t < now - endDaysAgo * DAY;
+  const callsLast7 = allCalls.filter(
+    (c) => c.startedAt && inWindow(new Date(c.startedAt).getTime(), 7, 0),
+  ).length;
+  const callsPrev7 = allCalls.filter(
+    (c) => c.startedAt && inWindow(new Date(c.startedAt).getTime(), 14, 7),
+  ).length;
+  const waitlistLast7 = waiting.filter(
+    (w) => w.createdAt && inWindow(new Date(w.createdAt).getTime(), 7, 0),
+  ).length;
+
+  // Estimated people reachable by activating the top camp targets.
+  const reachableTop3 = campTargets
+    .slice(0, 3)
+    .reduce((sum, c) => sum + c.waitlistCount, 0);
+
   return NextResponse.json({
     cells: result,
     campTargets,
@@ -139,6 +205,11 @@ export async function GET() {
       waitlist: waiting.length,
       calls: allCalls.length,
       uncoveredCells: result.filter((c) => !c.covered).length,
+      reachableTop3,
     },
+    categories,
+    severities,
+    timeline,
+    trends: { callsLast7, callsPrev7, waitlistLast7 },
   });
 }

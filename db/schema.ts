@@ -103,6 +103,8 @@ export const campRequests = pgTable("camp_requests", {
   services: jsonb("services").$type<string[]>().default([]),
   status: text("status").notNull().default("requested"), // requested | approved | active
   note: text("note"),
+  scheduledFor: timestamp("scheduled_for"),
+  expectedReach: integer("expected_reach"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 

@@ -54,3 +54,143 @@ body {
   border-radius: 999px;
   text-transform: uppercase;
 }
+
+/* ── Interactive primitives ─────────────────────────────────────────────── */
+
+.card-hover {
+  transition: box-shadow 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
+}
+.card-hover:hover {
+  box-shadow: 0 6px 20px rgba(42, 35, 32, 0.08);
+  transform: translateY(-1px);
+}
+
+/* Filter chips / segmented toggles */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.12s ease;
+  white-space: nowrap;
+}
+.chip:hover {
+  border-color: var(--primary);
+  color: var(--foreground);
+}
+.chip[data-active="true"] {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+/* Loading skeletons */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: #efe7e1;
+  border-radius: 0.5rem;
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.65),
+    transparent
+  );
+  animation: shimmer 1.4s infinite;
+}
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* Live polling dot */
+.live-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(47, 125, 123, 0.5);
+  animation: livepulse 1.8s infinite;
+}
+@keyframes livepulse {
+  0% { box-shadow: 0 0 0 0 rgba(47, 125, 123, 0.5); }
+  70% { box-shadow: 0 0 0 6px rgba(47, 125, 123, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(47, 125, 123, 0); }
+}
+
+/* Vertical timeline (audit trail) */
+.timeline {
+  position: relative;
+  margin-left: 0.5rem;
+}
+.timeline-item {
+  position: relative;
+  padding-left: 1.75rem;
+  padding-bottom: 1rem;
+}
+.timeline-item::before {
+  content: "";
+  position: absolute;
+  left: 0.32rem;
+  top: 1.35rem;
+  bottom: -0.25rem;
+  width: 2px;
+  background: var(--border);
+}
+.timeline-item:last-child::before {
+  display: none;
+}
+.timeline-dot {
+  position: absolute;
+  left: 0;
+  top: 0.3rem;
+  width: 0.78rem;
+  height: 0.78rem;
+  border-radius: 999px;
+  border: 2px solid var(--surface);
+  box-shadow: 0 0 0 1px var(--border);
+}
+
+/* Journey stepper */
+.step-bar {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--border);
+}
+.step-bar[data-done="true"] {
+  background: var(--primary);
+}
+
+/* Mini bar chart */
+.minibar-track {
+  background: var(--background);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.minibar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+details > summary {
+  list-style: none;
+  cursor: pointer;
+}
+details > summary::-webkit-details-marker {
+  display: none;
+}

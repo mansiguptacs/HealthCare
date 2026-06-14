@@ -23,6 +23,8 @@ export async function POST(req: Request) {
     lng?: number;
     services?: string[];
     note?: string;
+    scheduledFor?: string;
+    expectedReach?: number;
   };
 
   if (body.lat == null || body.lng == null) {
@@ -41,6 +43,8 @@ export async function POST(req: Request) {
       lng: body.lng,
       services: body.services ?? [],
       note: body.note ?? null,
+      scheduledFor: body.scheduledFor ? new Date(body.scheduledFor) : null,
+      expectedReach: body.expectedReach ?? null,
       status: "requested",
     })
     .returning();
